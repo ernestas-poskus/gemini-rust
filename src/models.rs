@@ -379,6 +379,7 @@ impl Message {
 /// Content modality type - specifies the format of model output
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum Modality {
     /// Default value.
     ModalityUnspecified,

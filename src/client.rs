@@ -10,6 +10,7 @@ use crate::{
         model::{File, ListFilesResponse},
     },
     generation::{ContentBuilder, GenerateContentRequest, GenerationResponse},
+    vertex_batch::{VertexBatchPredictionBuilder, VertexBatchPredictionHandle},
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -187,6 +188,12 @@ pub enum Error {
     },
 }
 
+#[derive(Debug, Clone)]
+enum AuthMethod {
+    ApiKey(String),
+    BearerToken(String),
+}
+
 /// Internal client for making requests to the Gemini API
 #[derive(Debug)]
 pub struct GeminiClient {
@@ -197,16 +204,22 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     /// Create a new client with custom base URL
-    fn with_base_url<K: AsRef<str>, M: Into<Model>>(
+    fn with_base_url<M: Into<Model>>(
         client_builder: ClientBuilder,
-        api_key: K,
+        auth: AuthMethod,
         model: M,
         base_url: Url,
     ) -> Result<Self, Error> {
-        let headers = HeaderMap::from_iter([(
-            HeaderName::from_static("x-goog-api-key"),
-            HeaderValue::from_str(api_key.as_ref()).context(InvalidApiKeySnafu)?,
-        )]);
+        let headers = match auth {
+            AuthMethod::ApiKey(api_key) => HeaderMap::from_iter([(
+                HeaderName::from_static("x-goog-api-key"),
+                HeaderValue::from_str(&api_key).context(InvalidApiKeySnafu)?,
+            )]),
+            AuthMethod::BearerToken(token) => HeaderMap::from_iter([(
+                reqwest::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).context(InvalidApiKeySnafu)?,
+            )]),
+        };
 
         let http_client = client_builder
             .default_headers(headers)
@@ -359,6 +372,13 @@ impl GeminiClient {
             async |r| r.json().await.context(DecodeResponseSnafu),
         )
         .await
+    }
+
+    /// Perform a POST request with JSON body and ignore the response body.
+    #[tracing::instrument(skip(self, body), fields(request.type = "post", request.url = %url))]
+    async fn post_empty<Req: serde::Serialize>(&self, url: Url, body: &Req) -> Result<(), Error> {
+        self.perform_request(|c| c.post(url).json(body), async |_r| Ok(()))
+            .await
     }
 
     /// Generate content
@@ -767,6 +787,32 @@ impl GeminiClient {
         self.get_json(url).await
     }
 
+    pub(crate) async fn create_vertex_batch_prediction_job(
+        &self,
+        request: crate::vertex_batch::model::VertexBatchPredictionJobRequest,
+        project: &str,
+        location: &str,
+    ) -> Result<crate::vertex_batch::model::VertexBatchPredictionJob, Error> {
+        let url = self.build_vertex_batch_jobs_url(project, location, None, None)?;
+        self.post_json(url, &request).await
+    }
+
+    pub(crate) async fn get_vertex_batch_prediction_job(
+        &self,
+        name: &str,
+    ) -> Result<crate::vertex_batch::model::VertexBatchPredictionJob, Error> {
+        let url = self.build_vertex_batch_job_url_from_name(name)?;
+        self.get_json(url).await
+    }
+
+    pub(crate) async fn cancel_vertex_batch_prediction_job(&self, name: &str) -> Result<(), Error> {
+        let url = self.build_vertex_batch_job_url_from_name(name)?;
+        let path = format!("{}:cancel", url.path());
+        let mut action_url = url;
+        action_url.set_path(&path);
+        self.post_empty(action_url, &json!({})).await
+    }
+
     /// Build a URL with the given suffix
     #[tracing::instrument(skip(self), ret(level = Level::DEBUG))]
     fn build_url_with_suffix(&self, suffix: &str) -> Result<Url, Error> {
@@ -780,6 +826,40 @@ impl GeminiClient {
     fn build_url(&self, endpoint: &str) -> Result<Url, Error> {
         let suffix = format!("{}:{endpoint}", self.model);
         self.build_url_with_suffix(&suffix)
+    }
+
+    fn build_vertex_url_with_suffix(&self, suffix: &str) -> Result<Url, Error> {
+        let mut root = self.base_url.clone();
+        root.set_query(None);
+        root.set_fragment(None);
+        root.set_path("/v1/");
+        root.join(suffix).context(ConstructUrlSnafu {
+            suffix: suffix.to_string(),
+        })
+    }
+
+    fn build_vertex_batch_jobs_url(
+        &self,
+        project: &str,
+        location: &str,
+        name: Option<&str>,
+        action: Option<&str>,
+    ) -> Result<Url, Error> {
+        let suffix = match name {
+            Some(name) => {
+                format!("projects/{project}/locations/{location}/batchPredictionJobs/{name}")
+            }
+            None => format!("projects/{project}/locations/{location}/batchPredictionJobs"),
+        };
+        let suffix = match action {
+            Some(action) => format!("{suffix}:{action}"),
+            None => suffix,
+        };
+        self.build_vertex_url_with_suffix(&suffix)
+    }
+
+    fn build_vertex_batch_job_url_from_name(&self, name: &str) -> Result<Url, Error> {
+        self.build_vertex_url_with_suffix(name.trim_start_matches('/'))
     }
 
     /// Build a URL for a batch operation
@@ -1093,7 +1173,7 @@ impl GeminiClient {
 /// # }
 /// ```
 pub struct GeminiBuilder {
-    key: String,
+    auth: AuthMethod,
     model: Model,
     client_builder: ClientBuilder,
     base_url: Url,
@@ -1103,7 +1183,17 @@ impl GeminiBuilder {
     /// Creates a new `GeminiBuilder` with the given API key.
     pub fn new<K: Into<String>>(key: K) -> Self {
         Self {
-            key: key.into(),
+            auth: AuthMethod::ApiKey(key.into()),
+            model: Model::default(),
+            client_builder: ClientBuilder::default(),
+            base_url: DEFAULT_BASE_URL.clone(),
+        }
+    }
+
+    /// Creates a new `GeminiBuilder` with a Bearer token.
+    pub fn new_bearer<K: Into<String>>(token: K) -> Self {
+        Self {
+            auth: AuthMethod::BearerToken(token.into()),
             model: Model::default(),
             client_builder: ClientBuilder::default(),
             base_url: DEFAULT_BASE_URL.clone(),
@@ -1122,6 +1212,12 @@ impl GeminiBuilder {
         self
     }
 
+    /// Sets Bearer token authentication for the client.
+    pub fn with_bearer_token<K: Into<String>>(mut self, token: K) -> Self {
+        self.auth = AuthMethod::BearerToken(token.into());
+        self
+    }
+
     /// Sets a custom base URL for the API.
     pub fn with_base_url(mut self, base_url: Url) -> Self {
         self.base_url = base_url;
@@ -1133,7 +1229,7 @@ impl GeminiBuilder {
         Ok(Gemini {
             client: Arc::new(GeminiClient::with_base_url(
                 self.client_builder,
-                self.key,
+                self.auth,
                 self.model,
                 self.base_url,
             )?),
@@ -1168,6 +1264,14 @@ impl Gemini {
         Self::with_model_and_base_url(api_key, model, DEFAULT_BASE_URL.clone())
     }
 
+    /// Create a new client with the specified Bearer token and model.
+    pub fn with_bearer_token<K: AsRef<str>, M: Into<Model>>(
+        token: K,
+        model: M,
+    ) -> Result<Self, Error> {
+        Self::with_bearer_token_and_base_url(token, model, DEFAULT_BASE_URL.clone())
+    }
+
     /// Create a new client with custom base URL
     pub fn with_base_url<K: AsRef<str>>(api_key: K, base_url: Url) -> Result<Self, Error> {
         Self::with_model_and_base_url(api_key, Model::default(), base_url)
@@ -1179,8 +1283,29 @@ impl Gemini {
         model: M,
         base_url: Url,
     ) -> Result<Self, Error> {
-        let client =
-            GeminiClient::with_base_url(Default::default(), api_key, model.into(), base_url)?;
+        let client = GeminiClient::with_base_url(
+            Default::default(),
+            AuthMethod::ApiKey(api_key.as_ref().to_string()),
+            model.into(),
+            base_url,
+        )?;
+        Ok(Self {
+            client: Arc::new(client),
+        })
+    }
+
+    /// Create a new client with the specified Bearer token, model, and base URL.
+    pub fn with_bearer_token_and_base_url<K: AsRef<str>, M: Into<Model>>(
+        token: K,
+        model: M,
+        base_url: Url,
+    ) -> Result<Self, Error> {
+        let client = GeminiClient::with_base_url(
+            Default::default(),
+            AuthMethod::BearerToken(token.as_ref().to_string()),
+            model.into(),
+            base_url,
+        )?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -1199,6 +1324,16 @@ impl Gemini {
     /// Start building a batch content generation request
     pub fn batch_generate_content(&self) -> BatchBuilder {
         BatchBuilder::new(self.client.clone())
+    }
+
+    /// Start building a Vertex AI batch prediction job.
+    pub fn vertex_batch_prediction(&self) -> VertexBatchPredictionBuilder {
+        VertexBatchPredictionBuilder::new(self.client.clone())
+    }
+
+    /// Get a handle to an existing Vertex AI batch prediction job.
+    pub fn get_vertex_batch_prediction(&self, name: &str) -> VertexBatchPredictionHandle {
+        VertexBatchPredictionHandle::new(name.to_string(), self.client.clone())
     }
 
     /// Get a handle to a batch operation by its name.

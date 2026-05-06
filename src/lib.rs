@@ -61,6 +61,9 @@ pub mod tools;
 /// File search for retrieval augmented generation (RAG)
 pub mod file_search;
 
+/// Vertex AI batch prediction jobs for Gemini models
+pub mod vertex_batch;
+
 #[cfg(test)]
 mod tests;
 
@@ -129,6 +132,12 @@ pub use batch::{
     handle::BatchHandle as Batch, handle::BatchStatus, handle::Error as BatchHandleError,
     model::BatchConfig, model::BatchGenerateContentRequest, model::BatchOperation,
     model::BatchStats, model::IndividualRequestError, model::RequestMetadata, Error as BatchError,
+};
+
+pub use vertex_batch::{
+    model::VertexBatchPredictionJob, model::VertexBatchPredictionJobRequest,
+    model::VertexBatchPredictionOutputInfo, model::VertexBatchPredictionRequestFileItem,
+    Error as VertexBatchError, VertexBatchPredictionBuilder, VertexBatchPredictionHandle,
 };
 
 // ========== File Management ==========
